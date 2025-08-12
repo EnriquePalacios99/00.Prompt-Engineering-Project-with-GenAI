@@ -1,0 +1,8 @@
+streamlit
+pandas
+python-dotenv
+pillow
+numpy
+google-genai>=0.3.0
+# Si usas Vertex Imagen:
+google-cloud-aiplatform>=1.70.0
