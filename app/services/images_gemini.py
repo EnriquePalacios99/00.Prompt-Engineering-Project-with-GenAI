@@ -1,9 +1,10 @@
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import os
 from io import BytesIO
+import math
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageChops
 
 from dotenv import load_dotenv
 import vertexai
@@ -11,10 +12,12 @@ from vertexai.preview.vision_models import ImageGenerationModel
 
 
 # ==========================
-# Utilidades de composición
+# Utilidades
 # ==========================
-def _hex_to_rgb(h: str):
-    h = h.lstrip("#")
+def _hex_to_rgb(h: Optional[str]) -> tuple:
+    h = (h or "").strip().lstrip("#")
+    if len(h) != 6:
+        return (20, 20, 20)
     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
 def _font(sz: int, bold: bool = True):
@@ -24,6 +27,7 @@ def _font(sz: int, bold: bool = True):
         return ImageFont.load_default()
 
 def _fit_shadow(img: Image.Image, max_w: int, max_h: int) -> Image.Image:
+    """Redimensiona con sombra suave alrededor (queda con halo)."""
     img = img.convert("RGBA")
     img.thumbnail((max_w, max_h), Image.LANCZOS)
     shadow = Image.new("RGBA", (img.width + 30, img.height + 30), (0, 0, 0, 0))
@@ -35,7 +39,22 @@ def _fit_shadow(img: Image.Image, max_w: int, max_h: int) -> Image.Image:
     can.alpha_composite(img, (0, 0))
     return can
 
-def _draw_texts_and_cta(bg: Image.Image, headline: str, subheadline: str, cta: str, brand_rgb: tuple):
+def _quarter_circle_mask(W: int, H: int, R: int) -> Image.Image:
+    """Máscara 'L' de un círculo centrado en (W, H) recortada al canvas: deja visible el cuarto inferior derecho."""
+    mask_big = Image.new("L", (W + R, H + R), 0)
+    d = ImageDraw.Draw(mask_big)
+    d.ellipse((W - R, H - R, W + R, H + R), fill=255)
+    return mask_big.crop((0, 0, W, H))
+
+def _draw_texts_and_cta(
+    bg: Image.Image,
+    headline: str,
+    subheadline: str,
+    cta: str,
+    headline_rgb: tuple,
+    subheadline_rgb: tuple,
+    cta_rgb: tuple
+):
     W, H = bg.size
     d = ImageDraw.Draw(bg)
 
@@ -67,9 +86,9 @@ def _draw_texts_and_cta(bg: Image.Image, headline: str, subheadline: str, cta: s
             y += lh
         return y
 
-    y = draw_wrap(headline, (x0, y0, x0 + text_w, y0 + int(H * 0.18)), fH, (20, 20, 20))
+    y = draw_wrap(headline, (x0, y0, x0 + text_w, y0 + int(H * 0.18)), fH, headline_rgb)
     y += int(H * 0.02)
-    y = draw_wrap(subheadline, (x0, y, x0 + text_w, y + int(H * 0.16)), fS, (60, 60, 60))
+    y = draw_wrap(subheadline, (x0, y, x0 + text_w, y + int(H * 0.16)), fS, subheadline_rgb)
     y += int(H * 0.04)
 
     # CTA pill
@@ -81,31 +100,179 @@ def _draw_texts_and_cta(bg: Image.Image, headline: str, subheadline: str, cta: s
         (btn_x + (btn_w - tw) / 2, btn_y + btn_h / 2 - (fC.size if hasattr(fC, "size") else 18) / 2),
         cta or "",
         font=fC,
-        fill=brand_rgb
+        fill=cta_rgb
     )
 
+def _rays_layer(
+    W: int, H: int,
+    count: int,
+    length_pct: float,
+    thickness_px: int,
+    spread_deg: float,
+    color_hex: Optional[str],
+    opacity: int
+) -> Image.Image:
+    """Crea una capa RGBA con 'rayos' saliendo desde la esquina inferior derecha (W,H)."""
+    color = _hex_to_rgb(color_hex or "#FFD700")
+    alpha = max(0, min(255, int(opacity)))
+    length = int(min(W, H) * max(0.05, min(1.5, length_pct)))  # admite >100% si se desea
+    thickness = max(1, int(thickness_px))
+    spread = max(0.0, min(180.0, spread_deg))
+
+    base_angle_deg = 225.0  # hacia arriba-izquierda
+    half_spread = spread / 2.0
+
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+
+    if count <= 0:
+        return layer
+
+    angles = []
+    if count == 1:
+        angles = [base_angle_deg]
+    else:
+        for i in range(count):
+            t = i / (count - 1)  # 0..1
+            angles.append(base_angle_deg - half_spread + t * spread)
+
+    for ang in angles:
+        rad = math.radians(ang)
+        ex = int(W + length * math.cos(rad))
+        ey = int(H + length * math.sin(rad))
+        d.line([(W, H), (ex, ey)], fill=color + (alpha,), width=thickness)
+    return layer
+
+def _ground_shadow_layer(
+    W: int, H: int,
+    px: int, py: int, w: int, h: int,
+    scale_x: float, scale_y: float,
+    offset_y_px: int,
+    opacity: int,
+    blur_radius: int
+) -> Image.Image:
+    """Crea una elipse difuminada como sombra de base debajo del packshot."""
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+
+    cx = px + w // 2
+    cy = py + h + int(offset_y_px)
+
+    ew = max(2, int(w * max(0.3, min(2.0, scale_x))))
+    eh = max(2, int(h * max(0.02, min(0.5, scale_y))))
+
+    x0 = cx - ew // 2
+    y0 = cy - eh // 2
+    x1 = cx + ew // 2
+    y1 = cy + eh // 2
+
+    alpha = max(0, min(255, int(opacity)))
+    d.ellipse([x0, y0, x1, y1], fill=(0, 0, 0, alpha))
+
+    blur = max(0, int(blur_radius))
+    if blur > 0:
+        layer = layer.filter(ImageFilter.GaussianBlur(blur))
+    return layer
+
+
+# ==========================
+# Composición principal
+# ==========================
 def _compose_with_packshot(
     base_bytes: bytes,
     canvas_size: Tuple[int, int],
     headline: str,
     subheadline: str,
     cta: str,
-    brand_hex: str,
-    background_img: Image.Image
+    headline_hex: str,
+    subheadline_hex: str,
+    cta_hex: str,
+    background_img: Image.Image,
+    # placa (cuarto de circunferencia)
+    quarter_radius_pct: float,
+    plate_hex: Optional[str],
+    plate_opacity: int,
+    # rayos
+    rays_enabled: bool,
+    rays_count: int,
+    rays_length_pct: float,
+    rays_thickness_px: int,
+    rays_color_hex: Optional[str],
+    rays_opacity: int,
+    rays_spread_deg: float,
+    # packshot
+    pack_scale_pct: float,
+    margin_right_pct: float,
+    margin_bottom_pct: float,
+    # sombra base
+    shadow_scale_x: float,
+    shadow_scale_y: float,
+    shadow_offset_y_px: int,
+    shadow_opacity: int,
+    shadow_blur_px: int,
 ) -> np.ndarray:
-    brand_rgb = _hex_to_rgb(brand_hex)
     W, H = canvas_size
+    headline_rgb = _hex_to_rgb(headline_hex)
+    subheadline_rgb = _hex_to_rgb(subheadline_hex)
+    cta_rgb = _hex_to_rgb(cta_hex)
 
-    # Fondo (siempre viene de Vertex; redimensionamos al canvas)
+    # Fondo de Vertex (capa base)
     bg = background_img.convert("RGBA").resize((W, H), Image.LANCZOS)
 
-    # Packshot + sombra
-    prod = Image.open(BytesIO(base_bytes)).convert("RGBA")
-    pack = _fit_shadow(prod, int(W * 0.6), int(H * 0.55))
-    bg.alpha_composite(pack, (int(W * 0.55), int(H * 0.18)))
+    # 1) Placa en cuarto de circunferencia (debajo de todo lo demás)
+    quarter_radius_pct = max(0.2, min(0.95, quarter_radius_pct))
+    R = int(min(W, H) * quarter_radius_pct)
+    quarter_mask = _quarter_circle_mask(W, H, R)
 
-    # Textos
-    _draw_texts_and_cta(bg, headline, subheadline, cta, brand_rgb)
+    if plate_hex and plate_opacity > 0:
+        plate_rgb = _hex_to_rgb(plate_hex)
+        plate = Image.new("RGBA", (W, H), plate_rgb + (max(0, min(255, int(plate_opacity))),))
+        bg.paste(plate, (0, 0), quarter_mask)
+
+    # 2) Rayos (entre la placa y el packshot)
+    if rays_enabled and rays_count > 0:
+        rays = _rays_layer(
+            W, H,
+            count=int(rays_count),
+            length_pct=float(rays_length_pct),
+            thickness_px=int(rays_thickness_px),
+            spread_deg=float(rays_spread_deg),
+            color_hex=rays_color_hex,
+            opacity=int(rays_opacity)
+        )
+        bg.alpha_composite(rays)
+
+    # 3) Packshot (encima de la placa y rayos) con sombra SOLO en la base
+    prod = Image.open(BytesIO(base_bytes)).convert("RGBA")
+    pack_scale_pct = max(0.2, min(2.0, pack_scale_pct))  # 20% a 200% del tamaño base relativo a R
+    target = int(R * 0.9 * pack_scale_pct)
+    prod_fit = _fit_shadow(prod, target, target)  # mantiene halo, pero lo ocultaremos con sombra base
+
+    # Posición
+    margin_right = int(min(W, H) * max(0.0, min(0.5, margin_right_pct)))
+    margin_bottom = int(min(W, H) * max(0.0, min(0.5, margin_bottom_pct)))
+    px = W - margin_right - prod_fit.width
+    py = H - margin_bottom - prod_fit.height
+
+    # Sombra de base (elipse) — debajo del packshot
+    shadow = _ground_shadow_layer(
+        W, H,
+        px, py, prod_fit.width, prod_fit.height,
+        scale_x=shadow_scale_x,
+        scale_y=shadow_scale_y,
+        offset_y_px=shadow_offset_y_px,
+        opacity=shadow_opacity,
+        blur_radius=shadow_blur_px
+    )
+    bg.alpha_composite(shadow)
+
+    # Pegamos el packshot encima. Para minimizar el halo lateral, ocultamos su halo con un recorte suave inferior.
+    # Truco: borrar el halo dejando solo el alfa del contenido original (reduce halo lateral).
+    # (Si quieres halo 0, podríamos renderizar sin _fit_shadow. Lo dejo así para conservar luz suave.)
+    bg.alpha_composite(prod_fit, (px, py))
+
+    # 4) Textos al final
+    _draw_texts_and_cta(bg, headline, subheadline, cta, headline_rgb, subheadline_rgb, cta_rgb)
 
     return np.array(bg.convert("RGB"))
 
@@ -114,10 +281,7 @@ def _compose_with_packshot(
 # Generación con Vertex (Imagen 3)
 # ==========================
 def _vertex_generate_background(W: int, H: int, prompt: str, brand_hex: str) -> Image.Image:
-    """
-    Genera un fondo con Vertex Imagen 3 (usa tamaño por defecto del modelo y luego resize).
-    Lanza excepción si algo falla (para que la UI lo muestre).
-    """
+    """Genera un fondo con Vertex Imagen 3 (usa tamaño por defecto del modelo y luego resize)."""
     load_dotenv()
     project = os.getenv("GCP_PROJECT")
     location = os.getenv("GCP_LOCATION", "us-central1")
@@ -130,10 +294,9 @@ def _vertex_generate_background(W: int, H: int, prompt: str, brand_hex: str) -> 
     vertexai.init(project=project, location=location)
     model = ImageGenerationModel.from_pretrained(model_name)
 
-    color_hint = f" Paleta acorde al color #{brand_hex.lstrip('#')}."
+    color_hint = f" Paleta acorde al color #{(brand_hex or '').lstrip('#')}."
     full_prompt = (prompt or "").strip() + color_hint
 
-    # No pasamos 'size' para evitar errores de soporte; el SDK genera (normalmente 1024x1024)
     gen = model.generate_images(
         prompt=full_prompt,
         number_of_images=1,
@@ -150,7 +313,7 @@ def _vertex_generate_background(W: int, H: int, prompt: str, brand_hex: str) -> 
 
 
 # ==========================
-# API principal (para Streamlit)
+# API principal
 # ==========================
 def generate_promos_with_gemini_background(
     base_bytes: bytes,
@@ -160,11 +323,38 @@ def generate_promos_with_gemini_background(
     n: int,
     canvas_size: Tuple[int, int],
     brand_hex: str,
-    bg_prompt: str = "Fondo fotográfico limpio estilo estudio con luz suave y textura sutil, espacio negativo a la izquierda para texto."
+    bg_prompt: str = "Fondo fotográfico limpio estilo estudio con luz suave y textura sutil, espacio negativo a la izquierda para texto.",
+    headline_hex: str = "#141414",
+    subheadline_hex: str = "#3C3C3C",
+    cta_hex: str = "#E30613",
+    # placa
+    quarter_radius_pct: float = 0.55,
+    plate_hex: Optional[str] = "#FFFFFF",
+    plate_opacity: int = 180,
+    # rayos
+    rays_enabled: bool = True,
+    rays_count: int = 12,
+    rays_length_pct: float = 0.6,
+    rays_thickness_px: int = 6,
+    rays_color_hex: Optional[str] = "#FFD700",
+    rays_opacity: int = 180,
+    rays_spread_deg: float = 80.0,
+    # packshot
+    pack_scale_pct: float = 0.9,
+    margin_right_pct: float = 0.06,
+    margin_bottom_pct: float = 0.06,
+    # sombra base
+    shadow_scale_x: float = 0.9,
+    shadow_scale_y: float = 0.08,
+    shadow_offset_y_px: int = 6,
+    shadow_opacity: int = 160,
+    shadow_blur_px: int = 12,
 ) -> List[np.ndarray]:
     """
     Genera n creatividades usando SIEMPRE Vertex Imagen 3 para el fondo.
-    Si Vertex falla, se propaga la excepción (para mostrarla en Streamlit).
+    - Packshot encima de la placa y rayos.
+    - Sombra únicamente en la base.
+    - Parámetros de placa, rayos, tamaño y posición del packshot configurables.
     """
     W, H = canvas_size
     outs: List[np.ndarray] = []
@@ -177,8 +367,28 @@ def generate_promos_with_gemini_background(
             headline=headline,
             subheadline=subheadline,
             cta=cta,
-            brand_hex=brand_hex,
-            background_img=bg_img
+            headline_hex=headline_hex,
+            subheadline_hex=subheadline_hex,
+            cta_hex=cta_hex,
+            background_img=bg_img,
+            quarter_radius_pct=quarter_radius_pct,
+            plate_hex=plate_hex,
+            plate_opacity=int(plate_opacity),
+            rays_enabled=bool(rays_enabled),
+            rays_count=int(rays_count),
+            rays_length_pct=float(rays_length_pct),
+            rays_thickness_px=int(rays_thickness_px),
+            rays_color_hex=rays_color_hex,
+            rays_opacity=int(rays_opacity),
+            rays_spread_deg=float(rays_spread_deg),
+            pack_scale_pct=float(pack_scale_pct),
+            margin_right_pct=float(margin_right_pct),
+            margin_bottom_pct=float(margin_bottom_pct),
+            shadow_scale_x=float(shadow_scale_x),
+            shadow_scale_y=float(shadow_scale_y),
+            shadow_offset_y_px=int(shadow_offset_y_px),
+            shadow_opacity=int(shadow_opacity),
+            shadow_blur_px=int(shadow_blur_px),
         )
         outs.append(arr)
 
