@@ -13,7 +13,7 @@ with st.sidebar:
     brand_hex = st.color_picker("Color de marca (influye en el prompt)", "#E30613")
     bg_prompt = st.text_area(
         "Prompt del fondo (Vertex Imagen 3)",
-        value="Fondo fotográfico limpio estilo estudio con luz suave y textura sutil, espacio negativo a la izquierda para texto.",
+        value="Una ilustración de caricatura caprichosa y vibrante ambientada en una cocina soleada, con una escena lúdica con hojuelas de maíz antropomórficas, salpicaduras de leche dinámicas, un tazón de cereal y una cuchara. El fondo tiene suaves degradados de amarillo brillante y azul claro, lo que sugiere un ambiente alegre. Numerosas hojuelas de maíz grandes y sonrientes, cada una con ojos anchos y expresivos, mejillas sonrosadas y pequeños brazos y piernas, están esparcidas por la escena. Algunas hojuelas flotan en el aire con los brazos saludando, mientras que otras están cerca de un tazón de cereal central. Salpicaduras dinámicas de leche blanca se congelan en movimiento, formando arcos y remolinos alrededor de los copos de maíz y el tazón, con varias gotas de leche suspendidas en el aire. El foco central es un alegre tazón a rayas azules y blancas rebosante de hojuelas de maíz doradas y un remolino de leche. Una cuchara metálica, representada con un brillo de caricatura, está parcialmente sumergida en el cereal, a punto de servir. La paleta de colores es brillante y acogedora, dominada por amarillos cálidos, blancos cremosos y azules fríos, acentuados con toques de naranja y rojo. Las líneas son limpias y audaces, características de la animación infantil, y la escena se representa con un brillo suave y acogedor.",
         height=100
     )
 

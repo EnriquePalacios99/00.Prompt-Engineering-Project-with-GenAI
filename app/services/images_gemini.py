@@ -266,9 +266,7 @@ def _compose_with_packshot(
     )
     bg.alpha_composite(shadow)
 
-    # Pegamos el packshot encima. Para minimizar el halo lateral, ocultamos su halo con un recorte suave inferior.
-    # Truco: borrar el halo dejando solo el alfa del contenido original (reduce halo lateral).
-    # (Si quieres halo 0, podríamos renderizar sin _fit_shadow. Lo dejo así para conservar luz suave.)
+    # Pegamos el packshot encima
     bg.alpha_composite(prod_fit, (px, py))
 
     # 4) Textos al final
@@ -280,7 +278,13 @@ def _compose_with_packshot(
 # ==========================
 # Generación con Vertex (Imagen 3)
 # ==========================
-def _vertex_generate_background(W: int, H: int, prompt: str, brand_hex: str) -> Image.Image:
+def _vertex_generate_background(
+    W: int,
+    H: int,
+    prompt: str,
+    brand_hex: str,
+    negative_prompt: Optional[str] = None
+) -> Image.Image:
     """Genera un fondo con Vertex Imagen 3 (usa tamaño por defecto del modelo y luego resize)."""
     load_dotenv()
     project = os.getenv("GCP_PROJECT")
@@ -294,14 +298,26 @@ def _vertex_generate_background(W: int, H: int, prompt: str, brand_hex: str) -> 
     vertexai.init(project=project, location=location)
     model = ImageGenerationModel.from_pretrained(model_name)
 
-    color_hint = f" Paleta acorde al color #{(brand_hex or '').lstrip('#')}."
-    full_prompt = (prompt or "").strip() + color_hint
+    # Mejoramos el prompt: fotografía de estudio limpia y minimal, espacio negativo y soft light.
+    brand_hint = f" Paleta coherente con el color #{(brand_hex or '').lstrip('#')}."
+    base_prompt = (prompt or "").strip()
+    full_prompt = (base_prompt + brand_hint).strip()
 
-    gen = model.generate_images(
-        prompt=full_prompt,
-        number_of_images=1,
-        safety_filter_level="block_few"
-    )
+    # Intentamos usar negative_prompt si el SDK lo soporta; si no, fallback sin romper.
+    try:
+        gen = model.generate_images(
+            prompt=full_prompt,
+            number_of_images=1,
+            safety_filter_level="block_few",
+            negative_prompt=(negative_prompt or None)
+        )
+    except TypeError:
+        # Algunas versiones no aceptan negative_prompt
+        gen = model.generate_images(
+            prompt=full_prompt,
+            number_of_images=1,
+            safety_filter_level="block_few"
+        )
 
     img_obj = gen.images[0]
     img_bytes = getattr(img_obj, "image_bytes", None) or getattr(img_obj, "_image_bytes", None)
@@ -323,7 +339,18 @@ def generate_promos_with_gemini_background(
     n: int,
     canvas_size: Tuple[int, int],
     brand_hex: str,
-    bg_prompt: str = "Fondo fotográfico limpio estilo estudio con luz suave y textura sutil, espacio negativo a la izquierda para texto.",
+    # Prompt de fondo mejorado por defecto (fotografía de estudio minimalista)
+    bg_prompt: str = (
+        "Fondo fotográfico de estudio limpio y moderno, con gradiente sutil y textura ligera. "
+        "Iluminación suave difusa (softbox a 45°), sombras muy suaves. "
+        "Espacio negativo amplio en el lado izquierdo para texto. "
+        "Estética minimalista y pulcra coherente con la marca."
+    ),
+    # Negative prompt opcional (para evitar overlays/personas/logo)
+    bg_negative: Optional[str] = (
+        "texto en pantalla, tipografías, logotipos inventados, marcas de agua, watermark, "
+        "personas, manos, rostros, desorden, artefactos, glitch, ruido"
+    ),
     headline_hex: str = "#141414",
     subheadline_hex: str = "#3C3C3C",
     cta_hex: str = "#E30613",
@@ -360,7 +387,12 @@ def generate_promos_with_gemini_background(
     outs: List[np.ndarray] = []
 
     for _ in range(max(1, int(n))):
-        bg_img = _vertex_generate_background(W, H, bg_prompt, brand_hex)
+        bg_img = _vertex_generate_background(
+            W, H,
+            prompt=bg_prompt,
+            brand_hex=brand_hex,
+            negative_prompt=bg_negative
+        )
         arr = _compose_with_packshot(
             base_bytes=base_bytes,
             canvas_size=canvas_size,

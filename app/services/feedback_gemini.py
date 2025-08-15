@@ -1,52 +1,83 @@
 # services/feedback_gemini.py
+# -----------------------------------------------------------------------------
+# Módulo de utilidades para analizar feedback de clientes con Gemini (google-genai)
+# - Soporta dos modos de cliente:
+#     * Vertex AI (si hay GCP_PROJECT y credenciales válidas)
+#     * API pública (si hay GOOGLE_API_KEY)
+# - Funciones principales:
+#     * summarize_reviews_gemini: resume reviews + plan de acción + respuesta pública
+#     * score_sentiment_gemini: clasifica sentimiento por review (positivo/neutral/negativo)
+#     * generate_customer_reply_gemini: redacta una respuesta a un comentario individual
+# - El prompting sigue la metodología RATOS-D (Rol, Audiencia, Tarea, Objetivo, Señales, Do/Don't)
+# - Incluye parsers robustos para extraer JSON incluso si el modelo devuelve texto extra.
+# -----------------------------------------------------------------------------
+
 import os, json, re
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv()  # Carga variables de entorno desde .env (si existe) al proceso
 
-GCP_PROJECT = os.getenv("GCP_PROJECT")
-GCP_LOCATION = os.getenv("GCP_LOCATION", "global")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
-
+# -----------------------------
+# Variables de entorno / Config
+# -----------------------------
+GCP_PROJECT = os.getenv("GCP_PROJECT")                     # ID de proyecto GCP (para Vertex)
+GCP_LOCATION = os.getenv("GCP_LOCATION", "global")         # Región/ubicación para Vertex (p. ej., us-central1)
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")               # API key pública (Gemini API)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")  # Modelo por defecto
 
 # -----------------------------
 # Cliente google-genai (Vertex o pública)
 # -----------------------------
 def _client():
+    """
+    Devuelve un cliente de google-genai.
+    - Intenta primero Vertex AI si hay GCP_PROJECT (y credenciales válidas).
+    - Si falla, usa API pública con GOOGLE_API_KEY (si existe).
+    - Si no hay nada configurado, levanta una excepción con instrucción.
+    """
     from google import genai
     if GCP_PROJECT:
         try:
+            # Cliente en modo Vertex AI (requiere credenciales y API habilitada)
             c = genai.Client(vertexai=True, project=GCP_PROJECT, location=GCP_LOCATION)
-            _ = c.models.list()
+            _ = c.models.list()  # Llamada simple para validar acceso
             return c
         except Exception:
+            # Si Vertex falla y hay API key, hacemos fallback a la API pública
             if GOOGLE_API_KEY:
                 return genai.Client(api_key=GOOGLE_API_KEY)
+            # Sin fallback posible → propagamos error
             raise
+    # Si no hay GCP_PROJECT, probamos con API key pública
     if GOOGLE_API_KEY:
         return genai.Client(api_key=GOOGLE_API_KEY)
+    # Nada configurado
     raise RuntimeError("Configura GCP_PROJECT o GOOGLE_API_KEY.")
-
 
 # ---------- Helpers de compatibilidad para construir parts/contents ----------
 def _make_text_part(text: str):
-    """Devuelve un 'part' de texto compatible con varias versiones del SDK."""
+    """
+    Devuelve un 'part' de texto compatible con varias versiones del SDK.
+    Algunas versiones exponen factories (from_text); otras aceptan constructor;
+    como última opción devolvemos el string (que el cliente suele aceptar).
+    """
     from google.genai import types
     try:
-        return types.Part.from_text(text=text)
+        return types.Part.from_text(text=text)  # Factory clásica
     except Exception:
         pass
     try:
-        return types.Part(text=text)
+        return types.Part(text=text)            # Constructor directo
     except Exception:
         pass
-    return text  # fallback: el cliente acepta strings
-
+    return text  # Último recurso: el cliente acepta 'contents' como str
 
 def _make_image_part(b: bytes, mime: str = "image/jpeg"):
-    """Devuelve un 'part' de imagen compatible con varias versiones del SDK."""
+    """
+    Devuelve un 'part' de imagen compatible con varias versiones del SDK.
+    Puede ser Part.from_bytes(...) o usar inline_data={"mime_type":..., "data":...}.
+    """
     from google.genai import types
     try:
         return types.Part.from_bytes(data=b, mime_type=mime)
@@ -56,27 +87,33 @@ def _make_image_part(b: bytes, mime: str = "image/jpeg"):
         return types.Part(inline_data={"mime_type": mime, "data": b})
     except Exception:
         pass
+    # Sin caminos válidos → explicitamos el error para que el usuario actualice el SDK
     raise RuntimeError("No se pudo construir Part de imagen con la versión instalada de google-genai")
-
 
 def _build_contents_robusto(prompt: str, images: Optional[List[bytes]] = None):
     """
-    Si no hay imágenes, devolvemos el string directamente (máx. compatibilidad).
-    Si hay imágenes, construimos un Content con parts compatibles.
+    Arma el 'contents' para la llamada a generate_content:
+    - Si no hay imágenes, devolvemos el string (máxima compatibilidad).
+    - Si hay imágenes, devolvemos una lista con un único Content(role="user", parts=[...]).
     """
     if not images:
-        return prompt
+        return prompt  # El cliente acepta 'contents' como string simple
     from google.genai import types
     parts = [_make_text_part(prompt)]
     for b in images:
         parts.append(_make_image_part(b, mime="image/jpeg"))
     return [types.Content(role="user", parts=parts)]
 
-
 # -----------------------------
 # Utilidades de extracción JSON
 # -----------------------------
 def _extract_json_obj(text: str) -> Dict[str, Any]:
+    """
+    Extrae un objeto JSON (dict) desde un string.
+    - Primero intenta json.loads directamente.
+    - Luego busca bloques con ```json ...```.
+    - Finalmente intenta el primer {...} grande que aparezca.
+    """
     try:
         return json.loads(text)
     except Exception:
@@ -89,8 +126,11 @@ def _extract_json_obj(text: str) -> Dict[str, Any]:
         return json.loads(m2.group(1))
     raise ValueError("No se pudo extraer JSON (obj)")
 
-
 def _extract_json_arr(text: str) -> List[Dict[str, Any]]:
+    """
+    Extrae un array JSON (list[dict]) desde un string, con las mismas heurísticas
+    que _extract_json_obj pero buscando [ ... ].
+    """
     try:
         val = json.loads(text)
         if isinstance(val, list):
@@ -105,11 +145,13 @@ def _extract_json_arr(text: str) -> List[Dict[str, Any]]:
         return json.loads(m2.group(1))
     raise ValueError("No se pudo extraer JSON (array)")
 
-
 def _clip(s: str, n: int = 160) -> str:
+    """
+    Recorta un texto a n caracteres (por defecto 160), reemplazando saltos de línea
+    por espacios. Añade '…' si hubo recorte.
+    """
     s = (s or "").strip().replace("\n", " ")
     return (s[:n] + "…") if len(s) > n else s
-
 
 # -----------------------------
 # Resumen de reviews (RATOS-D) → JSON
@@ -122,22 +164,24 @@ def summarize_reviews_gemini(
     max_reviews: int = 300
 ) -> Dict[str, Any]:
     """
-    Devuelve un dict JSON:
+    Resume un conjunto de reviews y devuelve un JSON con:
     {
-      "bullets": ["...", "...", "..."],  # 3–5
-      "recommendation": "1 párrafo con acción prioritaria",
-      "sentiment_ratio": {"positivo":0.00,"neutral":0.00,"negativo":0.00},
-      "action_plan": ["Paso; responsable; plazo", ...],  # 3–5
-      "customer_reply": "Párrafo 3–6 oraciones, empático y profesional",
-      "sample_size": int,
-      "raw": "texto de salida del modelo (debug)"
+      "bullets": ["...", "...", "..."],          # 3–5 bullets concisos
+      "recommendation": "párrafo con acción prioritaria",
+      "sentiment_ratio": {"positivo":0.00,"neutral":0.00,"negativo":0.00},  # fracciones 0..1 (aprox.)
+      "action_plan": ["Paso; responsable; plazo", ...],                     # 3–5 pasos
+      "customer_reply": "Respuesta pública breve (3–6 oraciones)",
+      "sample_size": int,                          # tamaño de muestra usado (≤ max_reviews)
+      "raw": "texto original devuelto por el modelo (para debug)"
     }
     """
     from google.genai import types
     c = _client()
 
+    # Subconjunto a analizar (limita el costo y el prompt)
     subset = [str(x) for x in reviews[:max_reviews]]
 
+    # Prompt siguiendo RATOS-D + formato JSON estricto
     prompt = f"""
 [ROL] Analista senior de Customer Experience en Perú.
 [AUDIENCIA] Equipo de producto/marketing y atención al cliente.
@@ -165,20 +209,25 @@ Devuelve únicamente:
 - ¿JSON válido? ¿3–5 bullets? ¿3–5 pasos en plan? ¿respuesta 3–6 oraciones? ¿sin texto extra?
 """.strip()
 
+    # Construcción robusta del 'contents' según versión del SDK
     contents = _build_contents_robusto(prompt, images=None)
+
+    # Configuración de sampling (controla creatividad y longitud)
     cfg = types.GenerateContentConfig(
         temperature=temperature,
         top_p=top_p,
         max_output_tokens=max_output_tokens,
     )
+
+    # Llamada al modelo
     resp = c.models.generate_content(model=GEMINI_MODEL, contents=contents, config=cfg)
     text = (resp.text or "").strip()
 
-    # Parse + normalización
+    # Parseo de JSON con fallback si falla
     try:
         data = _extract_json_obj(text)
     except Exception:
-        # Fallback mínimo
+        # Fallback mínimo si no se pudo extraer JSON:
         bullets = []
         for s in subset[:5]:
             s = re.sub(r"\s+", " ", s)
@@ -194,7 +243,9 @@ Devuelve únicamente:
             "raw": text
         }
 
-    # Bullets
+    # --- Normalizaciones / garantías de formato ---
+
+    # Bullets → lista de strings (máx. 5, sin punto final)
     bullets = data.get("bullets") or []
     if isinstance(bullets, str):
         bullets = [x.strip(" •-") for x in re.split(r"[\n;•-]+", bullets) if x.strip()]
@@ -202,12 +253,12 @@ Devuelve únicamente:
     if len(bullets) > 5:
         bullets = bullets[:5]
 
-    # Recomendación
+    # Recomendación → string no vacío
     reco = str(data.get("recommendation", "")).strip()
     if not reco:
         reco = "Prioriza una intervención concreta sobre el punto de mayor fricción repetido."
 
-    # Ratios
+    # Ratios → dict con fracciones 0..1 que sumen ~1 (si viene 0..100, reescalamos)
     sr = data.get("sentiment_ratio") or {}
     def _f(k):
         try:
@@ -221,7 +272,7 @@ Devuelve únicamente:
     else:
         srn = {"positivo": 0.33, "neutral": 0.34, "negativo": 0.33}
 
-    # Plan de acción
+    # Plan de acción → lista (máx. 5). Si viene str, lo partimos por separadores comunes.
     plan = data.get("action_plan") or []
     if isinstance(plan, str):
         plan = [x.strip(" •-") for x in re.split(r"[\n;•-]+", plan) if x.strip()]
@@ -230,11 +281,12 @@ Devuelve únicamente:
     if not plan:
         plan = ["Revisar tickets abiertos; CX; 2 semanas"]
 
-    # Respuesta pública
+    # Respuesta pública → string no vacío
     reply = str(data.get("customer_reply", "")).strip()
     if not reply:
         reply = "¡Gracias por tu comentario! Queremos ayudarte. Escríbenos por DM con tu número de pedido para revisar tu caso y darte una solución."
 
+    # Ensamblar salida final
     out = {
         "bullets": bullets or ["Sin hallazgos destacables."],
         "recommendation": reco,
@@ -246,11 +298,10 @@ Devuelve únicamente:
     }
     return out
 
-
 # -----------------------------
 # Scoring de sentimiento (RATOS-D) → lista de dicts
 # -----------------------------
-_LABELS = {"positivo", "negativo", "neutral"}
+_LABELS = {"positivo", "negativo", "neutral"}  # etiquetas válidas
 _SYNONYMS = {
     "pos": "positivo", "positive": "positivo", "+": "positivo",
     "neg": "negativo", "negative": "negativo", "-": "negativo",
@@ -258,11 +309,14 @@ _SYNONYMS = {
 }
 
 def _normalize_label(x: str) -> str:
+    """
+    Normaliza una etiqueta textual a {positivo|negativo|neutral}
+    aceptando sinónimos o atajos ("pos", "neg", "neu", "+", "-", "0").
+    """
     xl = (x or "").strip().lower()
     if xl in _LABELS:
         return xl
     return _SYNONYMS.get(xl, "neutral")
-
 
 def score_sentiment_gemini(
     reviews: List[str],
@@ -272,12 +326,15 @@ def score_sentiment_gemini(
     max_reviews: int = 200
 ) -> List[Dict]:
     """
-    Devuelve: [{"review":"(≤160c)","sentiment":"positivo|neutral|negativo","rationale":"..."}]
+    Clasifica sentimiento por review, devolviendo una lista de dicts:
+    [{"review":"(≤160c)","sentiment":"positivo|neutral|negativo","rationale":"..."}]
     """
     from google.genai import types
     c = _client()
 
     subset = [str(x) for x in reviews[:max_reviews]]
+
+    # Prompt RATOS-D con formato de salida SOLO JSON (array)
     sys = """
 [ROL] Analista de sentimiento.
 [TAREA] Clasifica cada review en 'positivo', 'negativo' o 'neutral' y explica brevemente por qué.
@@ -293,21 +350,28 @@ Devuelve SOLO un array JSON:
 - ¿JSON válido? ¿Etiquetas SOLO entre positivo/neutral/negativo? ¿sin texto extra?
 """.strip()
 
+    # Construcción robusta del 'contents'
     prompt = sys + "\nREVIEWS_JSON:\n" + json.dumps(subset, ensure_ascii=False)
     contents = _build_contents_robusto(prompt, images=None)
+
+    # Configuración conservadora para clasificación (baja temperature)
     cfg = types.GenerateContentConfig(
         temperature=temperature,
         top_p=top_p,
         max_output_tokens=max_output_tokens,
     )
+
+    # Llamada al modelo
     resp = c.models.generate_content(model=GEMINI_MODEL, contents=contents, config=cfg)
     text = (resp.text or "").strip()
 
+    # Intento de parsear como array JSON, con fallback simple
     try:
         rows = _extract_json_arr(text)
     except Exception:
         return [{"review": _clip(r), "sentiment": "neutral", "rationale": ""} for r in subset[:50]]
 
+    # Limpieza y normalización de filas
     clean: List[Dict[str, Any]] = []
     for r in rows:
         review = _clip(str(r.get("review") or ""))
@@ -317,10 +381,10 @@ Devuelve SOLO un array JSON:
             continue
         clean.append({"review": review, "sentiment": label, "rationale": rationale})
 
+    # Si el modelo devolvió vacío, degradamos a neutrales
     if not clean:
         clean = [{"review": _clip(r), "sentiment": "neutral", "rationale": ""} for r in subset[:50]]
     return clean
-
 
 # -----------------------------
 # Respuesta a un comentario individual
@@ -333,11 +397,13 @@ def generate_customer_reply_gemini(
     max_output_tokens: int = 512
 ) -> Dict[str, str]:
     """
-    Devuelve: {"reply":"...", "notes":"(opcional)"}
+    Genera una respuesta pública (3–6 oraciones) para un comentario individual.
+    Devuelve: {"reply":"..."}; en caso de error devuelve un reply genérico.
     """
     from google.genai import types
     c = _client()
 
+    # Prompt RATOS-D con reglas para no admitir culpa legal ni prometer cosas inexistentes
     prompt = f"""
 [ROL] Agente senior de atención al cliente.
 [TAREA] Redacta una respuesta pública breve (3–6 oraciones) al comentario del cliente.
@@ -357,13 +423,19 @@ def generate_customer_reply_gemini(
 }}
 """.strip()
 
+    # Construcción robusta del 'contents'
     contents = _build_contents_robusto(prompt, images=None)
+
+    # Config de generación (moderada)
     cfg = types.GenerateContentConfig(
         temperature=temperature, top_p=top_p, max_output_tokens=max_output_tokens
     )
+
+    # Llamada al modelo
     resp = c.models.generate_content(model=GEMINI_MODEL, contents=contents, config=cfg)
     text = (resp.text or "").strip()
 
+    # Parseo rígido de JSON con fallback amigable
     try:
         data = _extract_json_obj(text)
         reply = str(data.get("reply", "")).strip()
@@ -371,7 +443,7 @@ def generate_customer_reply_gemini(
             raise ValueError("sin campo reply")
         return {"reply": reply}
     except Exception:
-        # fallback simple
+        # Fallback simple si el modelo no regresó JSON válido
         return {
             "reply": "¡Gracias por escribirnos! Queremos ayudarte con tu caso. Por favor envíanos un mensaje directo con tu número de pedido y datos de contacto para revisar lo ocurrido y darte una solución."
         }

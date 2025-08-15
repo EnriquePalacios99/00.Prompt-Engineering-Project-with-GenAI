@@ -4,11 +4,17 @@ from dotenv import load_dotenv                   # Para cargar variables desde u
 load_dotenv()                                    # Carga las variables del archivo .env al entorno del proceso
 
 GCP_PROJECT = os.getenv("GCP_PROJECT")           # ID del proyecto de Google Cloud (para usar Vertex AI)
-GCP_LOCATION = os.getenv("GCP_LOCATION","global")# Región de Vertex AI (por defecto "global"; común: "us-central1")
+GCP_LOCATION = os.getenv("GCP_LOCATION", "global")  # Región de Vertex AI (por defecto "global"; común: "us-central1")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")     # Clave de la API pública de Gemini (google-genai)
-GEMINI_MODEL = os.getenv("GEMINI_MODEL","gemini-2.5-flash-lite")  # Modelo por defecto a usar para generación
-FORCE_PUBLIC = os.getenv("FORCE_GEMINI_PUBLIC","").lower() in ("1","true","yes")  # Si true/1/yes, fuerza API pública
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")  # Modelo por defecto a usar para generación
+FORCE_PUBLIC = os.getenv("FORCE_GEMINI_PUBLIC", "").lower() in ("1", "true", "yes")  # Si true/1/yes, fuerza API pública
 
+# ============================================================================
+# Función para obtener el cliente de Google Generative AI y el modo de conexión
+# - Intenta primero usar Vertex AI si está configurado.
+# - Si falla, usa la API pública con API key.
+# - Lanza error si no hay credenciales válidas.
+# ============================================================================
 def _get_client_and_mode():
     from google import genai                     # Import local para evitar cargar si no se usa
     if FORCE_PUBLIC and GOOGLE_API_KEY:          # Si se fuerza API pública y existe API key...
@@ -29,7 +35,13 @@ def _get_client_and_mode():
 
     raise RuntimeError("Configura GCP_PROJECT o GOOGLE_API_KEY.")  # Si no hay nada configurado, avisamos
 
-def _build_contents(name:str, attrs:str, channel:str, images:Optional[List[bytes]]):
+
+# ============================================================================
+# Función para construir el contenido del prompt para el modelo Gemini
+# - Incluye formato, instrucciones y modificadores por canal.
+# - Admite imágenes adicionales como entrada multimodal.
+# ============================================================================
+def _build_contents(name: str, attrs: str, channel: str, images: Optional[List[bytes]]):
     from google.genai import types               # Tipos del SDK para construir mensajes/partes
 
     # ========================= PROMPT MEJORADO (RATOS-D) =========================
@@ -86,7 +98,7 @@ Devuelve solo el JSON.
     # ============================================================================
 
     # (Opcional) Few-shot para mayor estabilidad: actívalo con PROMPT_FEWSHOT_EXAMPLE=1 en .env
-    if os.getenv("PROMPT_FEWSHOT_EXAMPLE","").lower() in ("1","true","yes"):
+    if os.getenv("PROMPT_FEWSHOT_EXAMPLE", "").lower() in ("1", "true", "yes"):
         few_shot = """
 [EJEMPLO — NO COPIAR LITERALMENTE, SOLO REFERENCIA DE ESTILO]
 Entrada:
@@ -116,41 +128,68 @@ Salida (JSON):
             parts.append(types.Part.from_bytes(data=b, mime_type="image/jpeg"))  # ...adjuntarlas como partes multimodales
     return [types.Content(role="user", parts=parts)]  # Construimos el "Content" del usuario con sus parts
 
-def _extract_json(text:str)->dict:
-    try: return json.loads(text)                 # 1) Intentar parsear directamente como JSON
-    except: pass
-    import re                                    # (re importado aquí también; no afecta funcionalidad)
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.S|re.I)  # 2) Buscar bloque ```json ... ```
-    if m: return json.loads(m.group(1))          #    Si hay fence code con JSON, parsearlo
+
+# ============================================================================
+# Función para extraer un JSON válido desde el texto de salida del modelo
+# - Intenta parseo directo.
+# - Busca bloques ```json ...``` si el directo falla.
+# - Si todo falla, lanza error.
+# ============================================================================
+def _extract_json(text: str) -> dict:
+    try:
+        return json.loads(text)                  # 1) Intentar parsear directamente como JSON
+    except:
+        pass
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.S | re.I)  # 2) Buscar bloque ```json ... ```
+    if m:
+        return json.loads(m.group(1))            #    Si hay fence code con JSON, parsearlo
     m2 = re.search(r"(\{.*\})", text, flags=re.S) # 3) Buscar el primer bloque {...} que parezca JSON
-    if m2: return json.loads(m2.group(1))        #    Si lo encuentra, parsearlo
+    if m2:
+        return json.loads(m2.group(1))           #    Si lo encuentra, parsearlo
     raise ValueError("No se pudo extraer JSON")  # 4) Si nada funcionó, avisar con error
 
-def _normalize(out:dict)->dict:
-    out.setdefault("short",""); out.setdefault("long","")       # Asegurar claves mínimas con valores por defecto
-    out.setdefault("bullets",[]); out.setdefault("hashtags",[])  # Asegurar listas aunque vengan ausentes
 
-    if isinstance(out["bullets"], str):                          # Si 'bullets' vino como string...
-        out["bullets"] = [x.strip() for x in re.split(r"\n|•|-|;", out["bullets"]) if x.strip()]  # ...separarlo en lista
-    if isinstance(out["hashtags"], str):                         # Si 'hashtags' vino como string...
-        out["hashtags"] = [t.strip() for t in re.split(r"[\s,]+", out["hashtags"]) if t.strip().startswith("#")]  # ...a lista
+# ============================================================================
+# Función para normalizar la estructura JSON resultante
+# - Asegura que las claves mínimas existan.
+# - Convierte strings en listas si es necesario.
+# - Limpia espacios y elementos vacíos.
+# ============================================================================
+def _normalize(out: dict) -> dict:
+    out.setdefault("short", ""); out.setdefault("long", "")
+    out.setdefault("bullets", []); out.setdefault("hashtags", [])
 
-    out["bullets"] = [str(x).strip() for x in out["bullets"] if str(x).strip()]    # Limpiar elementos vacíos/espacios
-    out["hashtags"] = [str(x).strip() for x in out["hashtags"] if str(x).strip()]  # Limpiar elementos vacíos/espacios
-    return out                                                   # Devolver JSON normalizado
+    if isinstance(out["bullets"], str):
+        out["bullets"] = [x.strip() for x in re.split(r"\n|•|-|;", out["bullets"]) if x.strip()]
+    if isinstance(out["hashtags"], str):
+        out["hashtags"] = [t.strip() for t in re.split(r"[\s,]+", out["hashtags"]) if t.strip().startswith("#")]
 
-def generate_product_description_gemini(name:str, attrs_text:str, channel:str, image_files:Optional[List[bytes]]=None,
-                                       temperature:float=0.9, top_p:float=0.95, max_tokens:int=1024)->Dict:
-    from google.genai import types                              # Tipos para la configuración de generación
-    client, _ = _get_client_and_mode()                          # Obtener cliente (público o Vertex) y el modo
-    contents = _build_contents(name, attrs_text, channel, image_files)  # Construir mensaje multimodal (prompt + imágenes)
-    config = types.GenerateContentConfig(temperature=temperature, top_p=top_p, max_output_tokens=max_tokens)  # Sampling
-    resp = client.models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)  # Llamada al modelo
-    text = (resp.text or "").strip()                            # Texto de salida (idealmente JSON)
+    out["bullets"] = [str(x).strip() for x in out["bullets"] if str(x).strip()]
+    out["hashtags"] = [str(x).strip() for x in out["hashtags"] if str(x).strip()]
+    return out
+
+
+# ============================================================================
+# Función principal para generar descripciones de producto usando Gemini
+# - Recibe datos del producto, canal y opcionalmente imágenes.
+# - Construye el prompt y llama al modelo configurado.
+# - Devuelve la respuesta parseada y normalizada.
+# ============================================================================
+def generate_product_description_gemini(name: str, attrs_text: str, channel: str,
+                                        image_files: Optional[List[bytes]] = None,
+                                        temperature: float = 0.9, top_p: float = 0.95,
+                                        max_tokens: int = 1024) -> Dict:
+    from google.genai import types
+    client, _ = _get_client_and_mode()                          # Obtener cliente y modo
+    contents = _build_contents(name, attrs_text, channel, image_files)  # Construir prompt multimodal
+    config = types.GenerateContentConfig(temperature=temperature, top_p=top_p, max_output_tokens=max_tokens)
+    resp = client.models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)
+    text = (resp.text or "").strip()
 
     try:
-        parsed = _extract_json(text)                            # Intentar extraer JSON de la respuesta
-        out = _normalize(parsed); out["raw"] = text             # Normalizar y guardar 'raw' para depurar/ver original
-        return out                                              # Devolver estructura final
+        parsed = _extract_json(text)                            # Intentar extraer JSON
+        out = _normalize(parsed)
+        out["raw"] = text                                       # Guardar texto original para depuración
+        return out
     except Exception:
-        return {"short":"","long":"","bullets":[],"hashtags":[],"raw":text}  # Si falla el parseo, devolver mínimos + raw
+        return {"short": "", "long": "", "bullets": [], "hashtags": [], "raw": text}  # Fallback mínimo
