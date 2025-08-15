@@ -6,3 +6,4 @@ numpy
 google-genai>=0.3.0
 # Si usas Vertex Imagen:
 google-cloud-aiplatform>=1.70.0
+python-docx>=0.8.11
